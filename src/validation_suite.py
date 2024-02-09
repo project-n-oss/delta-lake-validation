@@ -14,18 +14,21 @@ import time
 
 from dataclasses import dataclass
 from datetime import datetime, date
+from enum import Enum, auto
 from delta.pip_utils import configure_spark_with_delta_pip
 from google.cloud import storage
-from random import randint, random, choices
+from random import randint, random
 from pyspark.sql.types import StructType, StructField, StringType, IntegerType, DateType, TimestampType, DoubleType
-from typing import List, Iterator, Union, Optional
+from typing import List, Union, Optional
 
 # section: constants
 
 
 GS_URI_PREFIX = "gs://"
 
+
 # section: types
+
 
 @dataclass
 class OrderRecord:
@@ -61,19 +64,64 @@ class OrderRecord:
         return cls(order_id, item_count, cost, order_time, order_date)
 
 
+class TestRunMode(Enum):
+    """
+    How to run the tests.
+    In particular, some tests need to validate interleaved
+    behavior, e.g. delta op, crunch, delta op. In this case,
+    test can be run first with `setup_only` and then with `validation_only`.
+    Otherwise, tests will run both the setup and the validation `setup_and_validate` in one step
+    """
+    setup_only = auto()
+    validation_only = auto()
+    setup_and_validate = auto()
+
+
 @dataclass
 class TestConfig:
+    """
+    Contains config for tests
+    Additionally contains methods to facilitate running tests
+    """
     # name and location of main table
     table_name: str
     table_location: str
-    # name and location of updates table (used for merge test)
+    # name and location of updates table
     updates_table_name: str
     updates_table_location: str
+
+    # run params
     # whether to recreate table(s) before running tests
     recreate_setup: bool = True
+    exec_mode: TestRunMode = TestRunMode.setup_and_validate
+    # whether to use a catalog
+    catalog_enabled: bool = False
 
+    def get_table_id(self) -> str:
+        """
+        delta tables can be identified by:
+        1) (multi-part) name, e.g. "schema.table"
+        2) by location, e.g. "delta.`gs://bucket/root/`"
+        """
+        if self.catalog_enabled:
+            return self.table_name
+        else:
+            return table_id_from_location(self.table_location)
+
+    def get_updates_table_id(self) -> str:
+        if self.catalog_enabled:
+            return self.updates_table_name
+        else:
+            return table_id_from_location(self.updates_table_location)
 
 # section: utils
+
+def table_id_from_location(table_location: str) -> str:
+    """
+    Get delta table identifier from location
+    """
+    return f"delta.`{table_location}`"
+
 
 def to_hive_path(order_date: date) -> str:
     """
@@ -87,7 +135,7 @@ def datetime_to_date(dt: datetime) -> date:
 
 
 def to_datetime_literal(dt: Union[date, datetime]) -> str:
-    return dt.strftime("%Y-%m-%d %H:%M:%S")
+    return dt.strftime("%Y-%m-%d %H:%M:%S.%f")
 
 
 def prune_trailing_slash(path: str) -> str:
@@ -110,34 +158,12 @@ def get_orders_schema():
     ])
 
 
-def gen_random_records(count: int,
-                       order_dates: List[date] = None) -> List[OrderRecord]:
-    """
-    Generate count random records with the order_date partition column selected from `order_dates`.
-    Recorded records do not have partition field, since write_data appends it
-    """
-    if order_dates is None:
-        order_dates = [date(2024, 1, i) for i in range(10, 20)]
-
-    records = []
-    for _ in range(count):
-        order_date = choices(order_dates).pop()
-        # create a random time for this date
-        order_time = datetime(order_date.year, order_date.month, order_date.day, randint(0, 23), randint(0, 59))
-        order_id = f"order_{randint(1, 1000)}"
-        item_count = randint(1, 5)
-        cost = round(random() * 10, ndigits=2)
-        record = OrderRecord(order_id, item_count, cost, order_time, order_date)
-        records.append(record)
-
-    return records
-
-
-def list_objects(root_dir_uri: str) -> Iterator:
+def list_objects(root_dir_uri: str) -> List:
     """
     List all objects in bucket starting at given prefix.
 
-    root_dir_uri := gs://<bucket>/<path/to/root/of/deletion>
+    root_dir_uri: e.g. gs://<bucket>/<path/to/root/of/dir>
+    exclude_dir: exclude entries that end with trailing slash
     """
     if not root_dir_uri.startswith(GS_URI_PREFIX):
         raise ValueError("expected path start with: [gs://]")
@@ -154,13 +180,20 @@ def list_objects(root_dir_uri: str) -> Iterator:
 
     client = storage.Client()
 
+    # get objects
     bucket = client.get_bucket(bucket_name)
     if prefix is None:
         blobs = bucket.list_blobs()
     else:
         blobs = bucket.list_blobs(prefix=prefix)
 
-    return blobs
+    # filter directory prefixes
+    objects = []
+    for blob in blobs:
+        if not blob.name.endswith("/"):
+            objects.append(blob)
+
+    return objects
 
 
 def get_partition_files(table_location: str, order_date: date) -> List[str]:
@@ -358,8 +391,17 @@ def insert_records(spark, table_name: str, records: List[OrderRecord]):
             rows_sql.append(row_sql)
         tail = ', \n'.join(rows_sql)
         sql = head + tail
-        print(f"Running sql: {sql}")
+        # print(f"Running sql: {sql}")
         spark.sql(sql)
+
+
+def read_parquet_file(spark, file_location: str):
+    """
+    Read parquet file at `file_location` (full-qualified GCS location).
+    And print count
+    """
+    df = spark.read.format("parquet").load(file_location)
+    print("count", df.count())
 
 
 def read_table(spark, table_name: str):
@@ -410,17 +452,17 @@ def read_table_from_version(spark, table_name: str, version="2"):
     spark.sql(sql).show()
 
 
-def vacuum_table(spark, table_name: str):
+def vacuum_table(spark, table_id: str):
     """
     vacuum table
     """
     spark.sql("SET spark.databricks.delta.retentionDurationCheck.enabled=false")
-    sql = f"VACUUM {table_name} RETAIN 0 HOURS"
+    sql = f"VACUUM {table_id} RETAIN 0 HOURS"
     print(f"Running: {sql}")
     spark.sql(sql).show()
 
 
-def optimize_table(spark, table_name: str):
+def optimize_table(spark, table_id: str):
     """
     Optimize table.
 
@@ -429,16 +471,16 @@ def optimize_table(spark, table_name: str):
         OPTIMIZE TABLE_NAME WHERE order_date = '2024-01-01'
         OPTIMIZE TABLE_NAME WHERE order_date = '2024-01-01' ZORDER BY order_id
     """
-    sql = f"OPTIMIZE {table_name}"
+    sql = f"OPTIMIZE {table_id}"
     print(f"Running: {sql}")
     spark.sql(sql).show()
 
 
-def read_change_data_feed(spark, table_name: str, version_num="0"):
+def read_change_data_feed(spark, table_id: str, version_num="0"):
     """
     read change data feed
     """
-    sql = f"SELECT * FROM table_changes('{table_name}', {version_num})"
+    sql = f"SELECT * FROM table_changes('{table_id}', {version_num})"
     print(f"Running sql: {sql}")
     spark.sql(sql).show()
 
@@ -481,23 +523,38 @@ def merge_tables(spark, table_name: str, updates_table_name: str):
     spark.sql(sql).show()
 
 
+def setup_tables(spark, config: TestConfig, setup_updates_table = False):
+    """
+    (Re)Create delta tables
+    """
+    if config.recreate_setup:
+        if config.catalog_enabled:
+            recreate_table(spark, config.table_name, config.table_location)
+            if setup_updates_table:
+                recreate_table(spark, config.table_name, config.table_location)
+        else:
+            delete_bucket_objects(config.table_location, dry_run=False)
+            if setup_updates_table:
+                delete_bucket_objects(config.updates_table_location, dry_run=False)
+
+
+
 # section : test suite
     
-def test_1_write_to_delta(spark, config: TestConfig):
+def test_1_write_read_to_delta(spark, config: TestConfig):
     """
     Test 1: write to delta table
     Expected output: should print inserted rows        
     """
     print("Running Test 1: writing and reading delta lake")
-    if config.recreate_setup:
-        recreate_table(spark, config.table_name, config.table_location)
+    setup_tables(spark, config)
 
     data = [
         OrderRecord.generate(order_id="order_0"),
         OrderRecord.generate(order_id="order_1"),
     ]
     write_data(spark, config.table_location, data)
-    read_table(spark, config.table_name)
+    read_table(spark, config.get_table_id())
 
 
 def test_2_time_travel_read(spark, config: TestConfig):
@@ -509,8 +566,7 @@ def test_2_time_travel_read(spark, config: TestConfig):
     Expected output: should print only rows inserted in first batch
     """
     print("Running Test 2: time travel read")
-    if config.recreate_setup:
-        recreate_table(spark, config.table_name, config.table_location)
+    setup_tables(spark, config)
 
     data = [
         OrderRecord.generate(order_id="order_0_before_time_travel", order_date=date(2024,1,10)),
@@ -519,7 +575,7 @@ def test_2_time_travel_read(spark, config: TestConfig):
     write_data(spark, config.table_location, data)
 
     # get write timestamp from delta history
-    history = get_history(spark, config.table_name)
+    history = get_history(spark, config.get_table_id())
     time_travel_point = history[0]["timestamp"]
 
     # ensure writes don't have same timestamp
@@ -531,10 +587,10 @@ def test_2_time_travel_read(spark, config: TestConfig):
     ]
     write_data(spark, config.table_location, data)
     print("Reading full table; we expect to see all [4] records")
-    read_table(spark, config.table_name)
+    read_table(spark, config.get_table_id())
 
     print("Reading table from time stamp; we should see partial [2] records")
-    read_table_from_time(spark, config.table_name, time_travel_point)
+    read_table_from_time(spark, config.get_table_id(), time_travel_point)
 
 
 def test_3_read_table_version(spark, config: TestConfig):
@@ -544,149 +600,42 @@ def test_3_read_table_version(spark, config: TestConfig):
     Expected output: should print only rows inserted in first batch
     """
     print("Running Test 3: versioned read")
-    if config.recreate_setup:
-        recreate_table(spark, config.table_name, config.table_location)
+    setup_tables(spark, config)
 
     data = [
         OrderRecord.generate(order_id="order_0_before_version", order_date=date(2024,1,10)),
         OrderRecord.generate(order_id="order_1_before_version", order_date=date(2024,1,10))
     ]
-    insert_records(spark, config.table_name, data)
+    write_data(spark, config.table_location, data)
 
     # get table version
-    history = get_history(spark, config.table_name)
+    history = get_history(spark, config.get_table_id())
     version = history[0]["version"]
-    print("version is", version)
 
     data = [
         OrderRecord.generate(order_id="order_0_after_version", order_date=date(2024,1,10)),
         OrderRecord.generate(order_id="order_1_after_version", order_date=date(2024,1,10))
     ]
-    insert_records(spark, config.table_name, data)
+    write_data(spark, config.table_location, data)
     print("Reading full table; we expect to see all [4] records")
-    read_table(spark, config.table_name)
+    read_table(spark, config.get_table_id())
 
     print(f"Reading table from version={version}; we should see partial [2] records")
-    read_table_from_version(spark, config.table_name, version=version)
+    read_table_from_version(spark, config.get_table_id(), version=version)
 
 
-
-def test_4_vacuum_table(spark, config: TestConfig):
-    """
-    Test vacuum.
-    Setup:
-    - Insert data in many partitions.
-    - Delete data in predetermined partitions
-    - vacuum
-
-    Expected outcome: no data files in deleted partition dir
-
-    NOTE: This vacuums relies on objects being physically partitioned (named) based on hive partitioning scheme.
-    Which is not required by delta spec. But if the objects are not hive partitioned this test is invalid.
-    """
-    print("Running Test 4: Vacuum test")
-
-    if config.recreate_setup:
-        recreate_table(spark, config.table_name, config.table_location)
-
-    # insert data; data for these partitions [10, 14] will be deleted
-    to_delete_dates = [date(year=2024, month=1, day=day) for day in range(10, 15)]
-    to_delete_records = []
-    for dt in to_delete_dates:
-        to_delete_records.extend(gen_random_records(5, [dt]))
-    print(f"Inserting records [to delete]: [count: {len(to_delete_records)}] {to_delete_records}")
-    write_data(spark, config.table_location, to_delete_records)
-
-    # insert data; data for these partitions [16, 16] will be kept
-    to_keep_dates = [date(year=2024, month=1, day=day) for day in range(16, 17)]
-    to_keep_records = []
-    for dt in to_keep_dates:
-        to_keep_records.extend(gen_random_records(5, [dt]))
-    print(f"Inserting records [to live]: [count: {len(to_keep_records)}] {to_keep_records}")
-    insert_records(spark, config.table_name, to_keep_records)
-    write_data(spark, config.table_location, to_keep_records)
-
-    print("Reading full table, expect 35 records")
-    read_table(spark, config.table_name)
-
-    # perform delete
-    lower_bound = to_datetime_literal(date(2024, 1, 10))
-    upper_bound = to_datetime_literal(date(2024, 1, 14))
-    sql = f'DELETE FROM {config.table_name} WHERE order_date >= "{lower_bound}" AND order_date <= "{upper_bound}"'
-    print(f"Running: {sql}")
-    spark.sql(sql)
-
-    data_files = get_partition_files(config.table_location, to_delete_dates[0])
-    print(f"[pre-vacuum] Found [{len(data_files)}] data files for to be deleted partition [{to_delete_dates[0]}]; expected > 0")
-
-    # perform vacuum
-    vacuum_table(spark, config.table_name)
-
-    # check deleted partitions are empty
-    data_files = get_partition_files(config.table_location, to_delete_dates[0])
-    print(f"[post-vacuum] Found [{len(data_files)}] data files for deleted partition [{to_delete_dates[0]}]; expected == 0")
-
-    data_files = get_partition_files(config.table_location, to_keep_dates[0])
-    print(f"[post-vacuum] Found [{len(data_files)}] data files for kept partition [{to_keep_dates[0]}]; expected > 0")
-
-
-def test_5_optimize_table(spark, config: TestConfig):
-    """
-    Test 5: Optimize table command
-
-    Optimize performs multiple ops, crucially for this test, compaction of multiple small files into fewer files
-
-    Setup:
-        - perform many small inserts to create many small data files
-        - read file/objects before optimize
-        - optimize
-        - read file/objects after optimize
-
-    Expected outcome: new data files after running optimize
-    NOTE: old data files won't be removed until a "vacuum" is run.
-    """
-    print("Running Test 5: Optimize table")
-
-    if config.recreate_setup:
-        recreate_table_v2(spark, config.table_name, config.table_location)
-
-    # insert N batches
-    batch_count = 5
-    reference_date = date(2024, 1, 1)
-    for batch_num in range(batch_count):
-        records = gen_random_records(100, [reference_date])
-        print(f"Inserting [count: {len(records)}] records [batch: {batch_num}]")
-        insert_records(spark, config.table_name, records)
-
-    old_files = set(get_partition_files(config.table_location, reference_date))
-
-    # optimize
-    optimize_table(spark, config.table_name)
-
-    new_files = set(get_partition_files(config.table_location, reference_date))
-    only_new = new_files.difference(old_files)
-    only_old = old_files.difference(new_files)
-
-    # we expect optimize to have created a new file(s)
-    print(f"Total number of files: [before optimize = {len(old_files)}, after optimize = {len(new_files)}]")
-    print(f"Number of files *only* present before optimize [count: {len(only_old)}]; we expect == 0")
-    print(f"Number of files *only* present after optimize [count: {len(only_new)}]; we expect > 0")
-    print(f"New data files: [{only_new}]")
-
-
-def test_6_read_change_data_feed(spark, config: TestConfig):
+def test_4_read_change_data_feed(spark, config: TestConfig):
     """
     Read table change data feed.
     Expected outcome: show change feed
     """
     print("Running Test 6: Read change feed")
-    if config.recreate_setup:
-        recreate_table(spark, config.table_name, config.table_location)
-
-    read_change_data_feed(spark, config.table_name, version_num="1")
+    setup_tables(spark, config)
+    read_change_data_feed(spark, config.get_table_id(), version_num="1")
 
 
-def test_7_merge_data(spark, config: TestConfig):
+
+def test_5_merge_data(spark, config: TestConfig):
     """
     Test merge operation.
     Setup:
@@ -695,10 +644,8 @@ def test_7_merge_data(spark, config: TestConfig):
     - merge with policy that updates table win
     Expected outcome: main table has updated records
     """
-    print("Running Test 7: Merge")
-    if config.recreate_setup:
-        recreate_table(spark, config.table_name, config.table_location)
-        recreate_table(spark, config.updates_table_name, config.updates_table_location)
+    print("Running Test 5: Merge")
+    setup_tables(spark, config, setup_updates_table=True)
 
     # populate main table
     data = [
@@ -713,20 +660,20 @@ def test_7_merge_data(spark, config: TestConfig):
     write_data(spark, config.updates_table_location, data)
 
     print("Printing records [main table]")
-    read_table(spark, config.table_name)
+    read_table(spark, config.get_table_id())
 
     print("Printing records [updates table] [pre-merge]")
-    read_table(spark, config.updates_table_name)
+    read_table(spark, config.get_updates_table_id())
 
-    merge_tables(spark, config.table_name, config.updates_table_name)
+    merge_tables(spark, config.get_table_id(), config.get_updates_table_id())
 
     print("Printing records [updates table] [post-merge]")
     print("Expected record with order_id='order_0' with item_count=111")
     print("Expected record with order_id='order_1' with item_count=222")
-    read_table(spark, config.updates_table_name)
+    read_table(spark, config.get_updates_table_id())
 
 
-def test_8_overwrite_data(spark, config: TestConfig):
+def test_6_overwrite_data(spark, config: TestConfig):
     """
     Test overwrite.
     Setup:
@@ -735,9 +682,8 @@ def test_8_overwrite_data(spark, config: TestConfig):
         - read data
     Expected outcome: only new data should exist
     """
-    print("Running Test 8: Overwrite")
-    if config.recreate_setup:
-        recreate_table(spark, config.table_name, config.table_location)
+    print("Running Test 6: Overwrite")
+    setup_tables(spark, config)
 
     data = [
         OrderRecord.generate(order_id="order_0"),
@@ -745,7 +691,7 @@ def test_8_overwrite_data(spark, config: TestConfig):
     ]
     write_data(spark, config.table_location, data)
     print("Reading table before overwrite")
-    read_table(spark, config.table_name)
+    read_table(spark, config.get_table_id())
 
     # mutate data
     data = [
@@ -754,31 +700,205 @@ def test_8_overwrite_data(spark, config: TestConfig):
     ]
     write_data(spark, config.table_location, data, write_mode="overwrite")
     print("Reading table after overwrite")
-    read_table(spark, config.table_name)
+    read_table(spark, config.get_table_id())
 
 
-def test_9_concurrent_writes_same_partition(spark, config: TestConfig):
+def test_7_delete_data(spark, config: TestConfig):
+    """
+    Tests Delete op
+    Expected outcome: deleted data should not exist
+    """
+    print("Running Test 7: Delete")
+
+    setup_tables(spark, config)
+    to_delete_date = date(year=2024, month=1, day=10)
+    # data for these partitions [16, 16] will be kept
+    to_keep_date = date(year=2024, month=1, day=16)
+    # number of records per partition
+    records_per_partition = 5
+
+    # 2. setup test
+    to_delete_records = [OrderRecord.generate(order_date=to_delete_date) for _ in range(records_per_partition)]
+    print(f"Inserting records [to delete]: [count: {len(to_delete_records)}] {to_delete_records}")
+    write_data(spark, config.table_location, to_delete_records)
+
+    to_keep_records = [OrderRecord.generate(order_date=to_keep_date) for _ in range(records_per_partition)]
+    print(f"Inserting records [to live]: [count: {len(to_keep_records)}] {to_keep_records}")
+    write_data(spark, config.table_location, to_keep_records)
+
+    # 3. validate
+    print("Reading full table [pre-delete]. We expect [10] records")
+    read_table(spark, config.get_table_id())
+    order_date_literal = to_date_literal(date(2024, 1, 10))
+    sql = f'DELETE FROM {config.get_table_id()} WHERE order_date = "{order_date_literal}"'
+    print(f"Running sql: [{sql}]")
+    spark.sql(sql)
+    print(f"Reading full table [post-delete]. We expect [5] records for [{to_keep_date}]")
+    read_table(spark, config.get_table_id())
+
+
+def test_8_update_data(spark, config: TestConfig):
+    """
+    Test update op.
+    Setup:
+        - insert records
+        - update records (records with even item counts are set to 0)
+        - read table
+    Expected outcome: records should be updated
+    """
+    print("Running Test 8: Update table")
+
+    records = [OrderRecord.generate(item_count=count) for count in range(1, 10)]
+    write_data(spark, config.table_location, records)
+    print("Reading table [pre-update]")
+    read_table(spark, config.get_table_id())
+
+    # update all even item_count values to 0
+    sql = f"UPDATE {config.get_table_id()} SET item_count = 0 WHERE MOD(item_count, 2) = 0"
+    print(f"Running sql: {sql}")
+    spark.sql(sql)
+
+    print("Reading table [post-update]")
+    read_table(spark, config.get_table_id())
+
+
+def test_9_vacuum_table(spark, config: TestConfig):
+    """
+    Test vacuum.
+    Setup:
+    - Insert data in many partitions.
+    - Delete data in predetermined partitions
+    - vacuum
+
+    Expected outcome: no data files in deleted partition dir
+
+    NOTE: This vacuums relies on objects being physically partitioned (named) based on hive partitioning scheme.
+    Which is not required by delta spec. But if the objects are not hive partitioned this test is invalid.
+    """
+    print("Running Test 9: Vacuum test")
+
+    # 1. recreate table
+    setup_tables(spark, config)
+
+    # data for these partitions [10, 10] will be deleted
+    to_delete_date = date(year=2024, month=1, day=10)
+    # data for these partitions [16, 16] will be kept
+    to_keep_date = date(year=2024, month=1, day=16)
+    # number of records per partition
+    records_per_partition = 5
+
+    # 2. setup test
+    if config.exec_mode == TestRunMode.setup_only or config.exec_mode == TestRunMode.setup_and_validate:
+        to_delete_records = [OrderRecord.generate(order_date=to_delete_date) for _ in range(records_per_partition)]
+        print(f"Inserting records [to delete]: [count: {len(to_delete_records)}] {to_delete_records}")
+        write_data(spark, config.table_location, to_delete_records)
+
+        to_keep_records = [OrderRecord.generate(order_date=to_keep_date) for _ in range(records_per_partition)]
+        print(f"Inserting records [to live]: [count: {len(to_keep_records)}] {to_keep_records}")
+        write_data(spark, config.table_location, to_keep_records)
+    else:
+        print(f"Skipping test setup [config.exec_mode = {config.exec_mode}].")
+
+    if config.exec_mode == TestRunMode.setup_only:
+        # 2.1. exit; setup only run
+        return
+
+    # 3. run validation
+    print("Reading full table, expect 10 records")
+    read_table(spark, config.get_table_id())
+
+    # 3.1. perform delete
+    lower_bound = to_datetime_literal(date(2024, 1, 10))
+    upper_bound = to_datetime_literal(date(2024, 1, 10))
+    sql = f'DELETE FROM {config.get_table_id()} WHERE order_date >= "{lower_bound}" AND order_date <= "{upper_bound}"'
+    print(f"Running: {sql}")
+    spark.sql(sql)
+
+    data_files = get_partition_files(config.table_location, to_delete_date)
+    print(f"[pre-vacuum] Found [{len(data_files)}] data files for to be deleted partition [{to_delete_date}]; expected > 0")
+
+    # 3.2. perform vacuum
+    vacuum_table(spark, config.get_table_id())
+
+    # 3.3. check partition
+    data_files = get_partition_files(config.table_location, to_delete_date)
+    print(f"[post-vacuum] Found [{len(data_files)}] data files for deleted partition [{to_delete_date}]; expected == 0")
+    data_files = get_partition_files(config.table_location, to_keep_date)
+    print(f"[post-vacuum] Found [{len(data_files)}] data files for kept partition [{to_keep_date}]; expected > 0")
+
+
+def test_10_optimize_table(spark, config: TestConfig):
+    """
+    Test 5: test optimize table command
+
+    Optimize performs multiple ops, including:
+        - compaction of multiple small files into fewer files (exercized in this test)
+        - remove logically dropped columns
+
+    Setup:
+        - perform many small inserts to create many small data files
+        - read file/objects before optimize
+        - optimize
+        - read file/objects after optimize
+
+    Expected outcome: new data files after running optimize
+    NOTE: old data files won't be removed until a "vacuum" is run.
+    """
+    print("Running Test 10: Optimize table")
+
+    # 1. table setup
+    setup_tables(spark, config)
+
+    # 2. validation setup
+    # insert N batches of size M
+    batch_count = 5
+    batch_size = 5000
+    reference_date = date(2024, 1, 1)
+    for batch_num in range(batch_count):
+        records = [OrderRecord.generate(order_date=reference_date) for _ in range(batch_size)]
+        print(f"Inserting [count: {len(records)}] records [batch: {batch_num}]")
+        write_data(spark, config.table_location, records)
+
+    old_files = set(get_partition_files(config.table_location, reference_date))
+
+    # optimize
+    optimize_table(spark, config.get_table_id())
+
+    new_files = set(get_partition_files(config.table_location, reference_date))
+    only_new = new_files.difference(old_files)
+    only_old = old_files.difference(new_files)
+
+    # we expect optimize to have created a new file(s)
+    print(f"Total number of files: [before optimize = {len(old_files)}, after optimize = {len(new_files)}]")
+    print(f"Number of files *only* present before optimize [count: {len(only_old)}]; we expect == 0")
+    print(f"Number of files *only* present after optimize [count: {len(only_new)}]; we expect > 0")
+    print(f"New data files: [{only_new}]")
+
+
+
+def test_11_concurrent_writes_same_partition(spark, config: TestConfig):
     """
     NOTE: This test must be manually triggered from multiple workers simultaneously
     Expected outcome: writes should fail
     See: https://docs.delta.io/latest/concurrency-control.html#id3
     """
     print("Running Test 9: Concurrent write to the same partition")
-    order_dates = [date(2024, 1, 1)]
-    records = gen_random_records(10, order_dates)
+    order_date = date(2024, 1, 1)
+    records = [OrderRecord.generate(order_date=order_date) for _ in range(10)]
     print(f"Writing records: {records}")
     write_data(spark, config.table_location, records)
     write_data(spark, config.table_location, records, write_mode="overwrite")
 
 
-def test_10_concurrent_writes_different_partition(spark, config: TestConfig):
+def test_12_concurrent_writes_different_partition(spark, config: TestConfig):
     """
     NOTE: This test must be manually triggered from multiple workers simultaneously.
     Expected outcome: writes should succeed
     """
     print("Running Test 10: Concurrent write to the different partition")
     order_dates = [date(2024, 1, 1), date(2024, 1, 2)]
-    records = gen_random_records(10, order_dates)
+    records = [OrderRecord.generate(order_date=order_dates[0]) for _ in range(5)]
+    records.extend([OrderRecord.generate(order_date=order_dates[1]) for _ in range(5)])
     print(f"Writing records: {records}")
     write_data(spark, config.table_location, records)
 
@@ -791,20 +911,34 @@ test_config = TestConfig(
     table_name = "orders",
     updates_table_name = "orders_updates",
     updates_table_location = "gs://path/to/updates/table/root",
-    recreate_setup=True
+    recreate_setup=True,
+    exec_mode=TestRunMode.setup_and_validate,
+    catalog_enabled=False,
 )
 
 # only needed locally
 # spark = get_session()
 
+# sanity check
+#read_parquet_file(spark, "gs://path/to/table/path/to/object")
+
 # step 2: run tests
-#test_1_write_to_delta(spark, test_config)
+# read tests
+test_1_write_read_to_delta(spark, test_config)
 #test_2_time_travel_read(spark, test_config)
 #test_3_read_table_version(spark, test_config)
-#test_4_vacuum_table(spark, test_config)
-#test_5_optimize_table(spark, test_config)
-#test_6_read_change_data_feed(spark, test_config)
-#test_7_merge_data(spark, test_config)
-#test_8_overwrite_data(spark, test_config)
-#test_9_concurrent_writes_same_partition(spark, test_config)
-#test_10_concurrent_writes_different_partition(spark, test_config)
+#test_4_read_change_data_feed(spark, test_config)
+
+# write tests
+#test_5_merge_data(spark, test_config)
+#test_6_overwrite_data(spark, test_config)
+#test_7_delete_data(spark, test_config)
+#test_8_update_data(spark, test_config)
+
+# write tests - metadata
+#test_9_vacuum_table(spark, test_config)
+#test_10_optimize_table(spark, test_config)
+
+# concurrency tests
+#test_11_concurrent_writes_same_partition(spark, test_config) # 11
+#test_12_concurrent_writes_different_partition(spark, test_config) # 12
