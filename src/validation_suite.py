@@ -2,20 +2,20 @@
 Delta lake validation tests suite. A collections of tests that perform various data and metadata
 read/write operations on delta tables.
 
-NOTE: This assumes we are operating on order table (name is parameterized; schema is same)
+NOTE: This assumes we are operating on order table (name is parameterized; schema is fixed)
 
 To run tests (at the bottom of the module):
  1. create TestConfig
-object with params with GCS bucket which will store the delta table(s).
+    - object with params with GCS bucket which will store the delta table(s).
  2. uncomment and run test
 """
 import pyspark
 import time
 
 from dataclasses import dataclass
-from datetime import datetime, date
-from enum import Enum, auto
+from datetime import datetime, date, timedelta
 from delta.pip_utils import configure_spark_with_delta_pip
+from enum import Enum, auto
 from google.cloud import storage
 from random import randint, random
 from pyspark.sql.types import StructType, StructField, StringType, IntegerType, DateType, TimestampType, DoubleType
@@ -67,10 +67,9 @@ class OrderRecord:
 class TestRunMode(Enum):
     """
     How to run the tests.
-    In particular, some tests need to validate interleaved
-    behavior, e.g. delta op, crunch, delta op. In this case,
-    test can be run first with `setup_only` and then with `validation_only`.
-    Otherwise, tests will run both the setup and the validation `setup_and_validate` in one step
+    In particular, some tests need to validate interleaved behavior, e.g. delta op, crunch, delta op.
+    In this case, test can be run first with `setup_only` and then with `validation_only`.
+    Otherwise, tests will run both the setup and the validation, i.e. `setup_and_validate` in one step
     """
     setup_only = auto()
     validation_only = auto()
@@ -80,8 +79,8 @@ class TestRunMode(Enum):
 @dataclass
 class TestConfig:
     """
-    Contains config for tests
-    Additionally contains methods to facilitate running tests
+    Contains config for tests.
+    Additionally, contains methods to facilitate running tests
     """
     # name and location of main table
     table_name: str
@@ -272,14 +271,14 @@ def create_table(spark, table_name: str, table_location: str):
     """
     sql = f"""
     CREATE TABLE IF NOT EXISTS {table_name} (
-        order_id STRING, 
-        order_time TIMESTAMP, 
-        item_count INT, 
-        cost DOUBLE, 
+        order_id STRING,
+        order_time TIMESTAMP,
+        item_count INT,
+        cost DOUBLE,
         order_date DATE
     )
     USING DELTA
-    LOCATION '{table_location}'      
+    LOCATION '{table_location}'
     PARTITIONED BY (order_date)
     TBLPROPERTIES(delta.enableChangeDataFeed = true)
     """
@@ -352,7 +351,7 @@ def recreate_table_v2(spark, table_name: str, table_location: str):
 # section: test related ops
 
 
-def write_data(spark, location: str, data: List, write_mode="append"):
+def write_data(spark, table_location: str, data: List, write_mode="append"):
     """
     write to delta table.
     NOTE: this writes to the location
@@ -360,9 +359,19 @@ def write_data(spark, location: str, data: List, write_mode="append"):
     """
     order_schema = get_orders_schema()
     df = spark.createDataFrame(data, schema=order_schema)
-    df.write.partitionBy("order_date").format("delta").mode(write_mode).save(location)
+    df.write.partitionBy("order_date").format("delta").mode(write_mode).save(table_location)
 
-    
+
+def write_helper(spark, config: TestConfig, order_date: date, worker_id: int):
+    """
+    Generate and write data for given `order_date`
+    """
+    records = [OrderRecord.generate(order_date=order_date) for _ in range(10)]
+    print(f"[Task: {worker_id}] writing [N={len(records)}] records for date={order_date}")
+    write_data(spark, config.table_location, records)
+    write_data(spark, config.table_location, records, write_mode="overwrite")
+
+
 def insert_records(spark, table_name: str, records: List[OrderRecord]):
     """
     Insert(append) records to table.
@@ -379,7 +388,7 @@ def insert_records(spark, table_name: str, records: List[OrderRecord]):
         if record.order_date not in batches:
             batches[record.order_date] = []
         batches[record.order_date].append(record)
-    
+
     # convert each batch into an insert statement
     for batch_date, batch_records in batches.items(): 
         head = f"""INSERT INTO {table_name} PARTITION 
@@ -389,7 +398,7 @@ def insert_records(spark, table_name: str, records: List[OrderRecord]):
         for record in batch_records:
             row_sql = f"('{record.order_id}', {record.item_count}, cast('{record.cost}' as double), timestamp'{to_datetime_literal(record.order_time)}')"
             rows_sql.append(row_sql)
-        tail = ', \n'.join(rows_sql)
+        tail = ", \n".join(rows_sql)
         sql = head + tail
         # print(f"Running sql: {sql}")
         spark.sql(sql)
@@ -404,50 +413,42 @@ def read_parquet_file(spark, file_location: str):
     print("count", df.count())
 
 
-def read_table(spark, table_name: str):
+def read_table(spark, table_id: str):
     """
     Read data using table_name.
     """
-    sql = f"SELECT count(*) FROM {table_name}"
+    sql = f"SELECT count(*) FROM {table_id}"
     print(f"Running sql: {sql}")
     spark.sql(sql).show()
 
-    sql = f"SELECT * FROM {table_name}"
+    sql = f"SELECT * FROM {table_id}"
     print(f"Running sql: {sql}")
     spark.sql(sql).show()
 
 
-def read_table_from_location(spark, location: str):
-    """
-    Read data using location.
-    """
-    spark.sql(f"SELECT count(*) FROM delta.`{location}`").show()
-    spark.sql(f"SELECT * FROM delta.`{location}`").show()
-
-
-def read_table_from_time(spark, table_name: str, time_travel_point: Union[date, datetime]):
+def read_table_from_time(spark, table_id: str, time_travel_point: Union[date, datetime]):
     """
     Query the table from a different time point
     """
     date_lit = to_datetime_literal(time_travel_point)
-    sql = f'SELECT count(*) FROM {table_name} TIMESTAMP AS OF "{date_lit}"'
+    sql = f'SELECT count(*) FROM {table_id} TIMESTAMP AS OF "{date_lit}"'
     print(f"Running sql: {sql}")
     spark.sql(sql).show()
 
-    sql = f'SELECT * FROM {table_name} TIMESTAMP AS OF "{date_lit}"'
+    sql = f'SELECT * FROM {table_id} TIMESTAMP AS OF "{date_lit}"'
     print(f"Running sql: {sql}")
     spark.sql(sql).show()
 
 
-def read_table_from_version(spark, table_name: str, version="2"):
+def read_table_from_version(spark, table_id: str, version="2"):
     """
     Query a different version of table
     """
-    sql = f"SELECT count(*) FROM {table_name} VERSION AS OF {version}"
+    sql = f"SELECT count(*) FROM {table_id} VERSION AS OF {version}"
     print(f"Running sql: {sql}")
     spark.sql(sql).show()
 
-    sql = f"SELECT * FROM {table_name} VERSION AS OF {version}"
+    sql = f"SELECT * FROM {table_id} VERSION AS OF {version}"
     print(f"Running sql: {sql}")
     spark.sql(sql).show()
 
@@ -485,7 +486,7 @@ def read_change_data_feed(spark, table_id: str, version_num="0"):
     spark.sql(sql).show()
 
 
-def merge_tables(spark, table_name: str, updates_table_name: str):
+def merge_tables(spark, table_id: str, updates_table_id: str):
     """
     Merge tables.
     Merge when order_ids match. With values being updated to the updates table
@@ -493,16 +494,16 @@ def merge_tables(spark, table_name: str, updates_table_name: str):
     # merge main and updates table
     # if conflicted, updates win
     sql = f"""
-    MERGE INTO {table_name}
-    USING {updates_table_name}
-    ON {updates_table_name}.order_id = {table_name}.order_id
+    MERGE INTO {table_id}
+    USING {updates_table_id}
+    ON {updates_table_id}.order_id = {table_id}.order_id
     WHEN MATCHED THEN
         UPDATE SET
-        order_id = {updates_table_name}.order_id,
-        order_time = {updates_table_name}.order_time, 
-        item_count = {updates_table_name}.item_count,
-        cost = {updates_table_name}.cost, 
-        order_date = {updates_table_name}.order_date       
+        order_id = {updates_table_id}.order_id,
+        order_time = {updates_table_id}.order_time,
+        item_count = {updates_table_id}.item_count,
+        cost = {updates_table_id}.cost,
+        order_date = {updates_table_id}.order_date
     WHEN NOT MATCHED
         THEN INSERT (
             order_id,
@@ -512,11 +513,11 @@ def merge_tables(spark, table_name: str, updates_table_name: str):
             order_date
     )
     VALUES (
-        {updates_table_name}.order_id,
-        {updates_table_name}.order_time,
-        {updates_table_name}.item_count,
-        {updates_table_name}.cost,
-        {updates_table_name}.order_date
+        {updates_table_id}.order_id,
+        {updates_table_id}.order_time,
+        {updates_table_id}.item_count,
+        {updates_table_id}.cost,
+        {updates_table_id}.order_date
     )
     """
     print(f"Running merge sql: {sql}")
@@ -543,7 +544,7 @@ def setup_tables(spark, config: TestConfig, setup_updates_table = False):
     
 def test_1_write_read_to_delta(spark, config: TestConfig):
     """
-    Test 1: write to delta table
+    Test write and read to delta table
     Expected output: should print inserted rows        
     """
     print("Running Test 1: writing and reading delta lake")
@@ -559,7 +560,8 @@ def test_1_write_read_to_delta(spark, config: TestConfig):
 
 def test_2_time_travel_read(spark, config: TestConfig):
     """
-    Test 2: read from time travel point. 
+    Test read from time travel point
+
     Setup: Insert some data at time t0, busy wait, insert more data at time t1.
     time travel to (t1 - epsilon) and read data and only data from. 
 
@@ -595,7 +597,7 @@ def test_2_time_travel_read(spark, config: TestConfig):
 
 def test_3_read_table_version(spark, config: TestConfig):
     """
-    Test 3: read table from a given version
+    Test read table from a given version
 
     Expected output: should print only rows inserted in first batch
     """
@@ -637,7 +639,8 @@ def test_4_read_change_data_feed(spark, config: TestConfig):
 
 def test_5_merge_data(spark, config: TestConfig):
     """
-    Test merge operation.
+    Test merge operation
+
     Setup:
     - Write data to main table
     - write conflicting data to updates table
@@ -675,7 +678,8 @@ def test_5_merge_data(spark, config: TestConfig):
 
 def test_6_overwrite_data(spark, config: TestConfig):
     """
-    Test overwrite.
+    Test overwrite
+
     Setup:
         - insert data
         - overwrite data
@@ -705,7 +709,8 @@ def test_6_overwrite_data(spark, config: TestConfig):
 
 def test_7_delete_data(spark, config: TestConfig):
     """
-    Tests Delete op
+    Test Delete op
+
     Expected outcome: deleted data should not exist
     """
     print("Running Test 7: Delete")
@@ -739,7 +744,7 @@ def test_7_delete_data(spark, config: TestConfig):
 
 def test_8_update_data(spark, config: TestConfig):
     """
-    Test update op.
+    Test update op
     Setup:
         - insert records
         - update records (records with even item counts are set to 0)
@@ -829,7 +834,7 @@ def test_9_vacuum_table(spark, config: TestConfig):
 
 def test_10_optimize_table(spark, config: TestConfig):
     """
-    Test 5: test optimize table command
+    Test optimize table command
 
     Optimize performs multiple ops, including:
         - compaction of multiple small files into fewer files (exercized in this test)
@@ -875,32 +880,49 @@ def test_10_optimize_table(spark, config: TestConfig):
     print(f"New data files: [{only_new}]")
 
 
-
 def test_11_concurrent_writes_same_partition(spark, config: TestConfig):
     """
-    NOTE: This test must be manually triggered from multiple workers simultaneously
-    Expected outcome: writes should fail
+    Test concurrent write to the same partition
+    Expected outcome: writes should fail. With failure trace like:
+
+    > delta.exceptions.ProtocolChangedException: The protocol version of the Delta table has been changed by a concurrent update. This happens when multiple writers are writing to an empty directory. Creating the table ahead of time will avoid this conflict. Please try the operation again.
+
     See: https://docs.delta.io/latest/concurrency-control.html#id3
+    See: https://stackoverflow.com/a/38315201 for using pyspark with multithreading
     """
-    print("Running Test 9: Concurrent write to the same partition")
+    print("Running Test 11: Concurrent write to the same partition")
+
+    # 1. setup
+    setup_tables(spark, config)
     order_date = date(2024, 1, 1)
-    records = [OrderRecord.generate(order_date=order_date) for _ in range(10)]
-    print(f"Writing records: {records}")
-    write_data(spark, config.table_location, records)
-    write_data(spark, config.table_location, records, write_mode="overwrite")
+
+    # 2. write from multiple workers
+    worker_count = 2
+    for worker_id in range(worker_count):
+        # NOTE: InheritableThread could be used to run any operation concurrently
+        # however, the test setup logic would have to refactored
+        t = pyspark.InheritableThread(target=write_helper, args=(spark, config, order_date, worker_id))
+        t.start()
 
 
 def test_12_concurrent_writes_different_partition(spark, config: TestConfig):
     """
-    NOTE: This test must be manually triggered from multiple workers simultaneously.
-    Expected outcome: writes should succeed
+    Test concurrent write to the different partition
+    Expected outcome: writes should fail due to concurrent writes
     """
-    print("Running Test 10: Concurrent write to the different partition")
-    order_dates = [date(2024, 1, 1), date(2024, 1, 2)]
-    records = [OrderRecord.generate(order_date=order_dates[0]) for _ in range(5)]
-    records.extend([OrderRecord.generate(order_date=order_dates[1]) for _ in range(5)])
-    print(f"Writing records: {records}")
-    write_data(spark, config.table_location, records)
+    print("Running Test 12: Concurrent write to the different partition")
+
+    # 1. setup
+    setup_tables(spark, config)
+
+    # 2. validate; write from multiple workers
+    order_range_start = date(2024, 1, 1)
+    worker_count = 2
+    for worker_index in range(worker_count):
+        # each worker is assigned a separate date
+        worker_order_date = order_range_start + timedelta(days=worker_index)
+        t = pyspark.InheritableThread(target=write_helper, args=(spark, config, worker_order_date, worker_index))
+        t.start()
 
 
 # section: run tests
@@ -915,14 +937,11 @@ test_config = TestConfig(
     exec_mode=TestRunMode.setup_and_validate,
     catalog_enabled=False,
 )
-
 # only needed locally
 # spark = get_session()
 
-# sanity check
-#read_parquet_file(spark, "gs://path/to/table/path/to/object")
-
 # step 2: run tests
+
 # read tests
 test_1_write_read_to_delta(spark, test_config)
 #test_2_time_travel_read(spark, test_config)
@@ -940,5 +959,5 @@ test_1_write_read_to_delta(spark, test_config)
 #test_10_optimize_table(spark, test_config)
 
 # concurrency tests
-#test_11_concurrent_writes_same_partition(spark, test_config) # 11
-#test_12_concurrent_writes_different_partition(spark, test_config) # 12
+# test_11_concurrent_writes_same_partition(spark, test_config)
+# test_12_concurrent_writes_different_partition(spark, test_config)
