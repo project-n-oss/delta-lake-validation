@@ -82,8 +82,9 @@ class TestConfig:
     Contains config for tests.
     Additionally, contains methods to facilitate running tests
     """
-    # name and location of main table
+    # name
     table_name: str
+    #  location of main table. NOTE location must end with trailing slash
     table_location: str
     # name and location of updates table
     updates_table_name: str
@@ -221,12 +222,12 @@ def delete_bucket_objects(root_dir_uri: str, dry_run=True):
 
 # section: spark util functions
 
-def get_session():
+def get_spark_session():
     """
     get spark session
     """
     # NOTE(dataproc): the configs will only take effect if they were set at cluster creation time
-    builder = pyspark.sql.SparkSession.builder.appName("MyApp") \
+    builder = pyspark.sql.SparkSession.builder.appName("DeltaValidationTest0") \
         .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension") \
         .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
 
@@ -241,8 +242,11 @@ def list_tables(spark):
     spark.sql("SHOW TABLES").show()
 
 
-def desc_table(spark, table_name: str):
-    spark.sql(f"DESCRIBE DETAIL {table_name}").show()
+def desc_table(spark, table_id: str):
+    cmd = f"DESCRIBE EXTENDED {table_id}"
+    spark.sql(cmd).show()
+    cmd = f"DESCRIBE DETAIL {table_id}"
+    spark.sql(cmd).show()
 
 
 def show_history(spark, table_name: str):
@@ -291,16 +295,21 @@ def register_table(spark, table_name: str, table_location: str):
     register table that already exists at location, i.e. created without metastore
     """
     sql = f"""
-    CREATE TABLE IF NOT EXISTS {table_name} 
+    CREATE TABLE IF NOT EXISTS {table_name}
     USING DELTA
-    LOCATION '{table_location}'      
+    LOCATION '{table_location}'
     """
     print(f"Running sql: {sql}")
     spark.sql(sql).show()
 
 
-def enable_change_data_feed(spark, table_name: str):
-    spark.sql(f"ALTER TABLE {table_name} SET TBLPROPERTIES (delta.enableChangeDataFeed = true)")
+def set_log_retention(spark, table_id: str):
+    spark.sql(f'ALTER TABLE {table_id} SET TBLPROPERTIES (delta.logRetentionDuration = "interval 0 hours")')
+
+
+def enable_change_data_feed(spark, table_id: str):
+    spark.sql(f"ALTER TABLE {table_id} SET TBLPROPERTIES (delta.enableChangeDataFeed = true)")
+
 
 
 def recreate_table(spark, table_name: str, table_location: str, data: Optional[List] = None):
@@ -350,6 +359,17 @@ def recreate_table_v2(spark, table_name: str, table_location: str):
 
 # section: test related ops
 
+def write_parquet(spark, file_location: str, data: List, write_mode="overwrite"):
+    """
+    write parquet file
+    NOTE: this writes to the location
+    write_mode: ("append", "overwrite")
+    """
+    order_schema = get_orders_schema()
+    df = spark.createDataFrame(data, schema=order_schema)
+    df.write.parquet(file_location, mode=write_mode)
+    print(f"Wrote [{write_mode}] parquet file to [{file_location}]")
+
 
 def write_data(spark, table_location: str, data: List, write_mode="append"):
     """
@@ -377,7 +397,7 @@ def insert_records(spark, table_name: str, records: List[OrderRecord]):
     Insert(append) records to table.
     Inserts are batched by partition_date
 
-    Example stmt:   
+    Example stmt:
     INSERT INTO orders PARTITION (order_date =  date'2024-01-01') (order_id, item_count, cost, order_time) VALUES
         ('order_0', 1, cast('10.0' as double), timestamp'2024-01-01 16:16:16'),
         ('order_1', 1, cast('10.0' as double), timestamp'2024-01-01 16:16:16');
@@ -390,9 +410,9 @@ def insert_records(spark, table_name: str, records: List[OrderRecord]):
         batches[record.order_date].append(record)
 
     # convert each batch into an insert statement
-    for batch_date, batch_records in batches.items(): 
-        head = f"""INSERT INTO {table_name} PARTITION 
-                    (order_date =  date'{to_date_literal(batch_date)}') 
+    for batch_date, batch_records in batches.items():
+        head = f"""INSERT INTO {table_name} PARTITION
+                    (order_date =  date'{to_date_literal(batch_date)}')
                     (order_id, item_count, cost, order_time) VALUES \n"""
         rows_sql = []
         for record in batch_records:
@@ -404,12 +424,16 @@ def insert_records(spark, table_name: str, records: List[OrderRecord]):
         spark.sql(sql)
 
 
-def read_parquet_file(spark, file_location: str):
+def read_parquet_file(spark, file_location: str) -> pyspark.sql.dataframe.DataFrame:
     """
     Read parquet file at `file_location` (full-qualified GCS location).
-    And print count
+    And return dataframe
     """
     df = spark.read.format("parquet").load(file_location)
+    return df
+
+
+def count_dataframe(df):
     print("count", df.count())
 
 
@@ -477,15 +501,6 @@ def optimize_table(spark, table_id: str):
     spark.sql(sql).show()
 
 
-def read_change_data_feed(spark, table_id: str, version_num="0"):
-    """
-    read change data feed
-    """
-    sql = f"SELECT * FROM table_changes('{table_id}', {version_num})"
-    print(f"Running sql: {sql}")
-    spark.sql(sql).show()
-
-
 def merge_tables(spark, table_id: str, updates_table_id: str):
     """
     Merge tables.
@@ -541,11 +556,11 @@ def setup_tables(spark, config: TestConfig, setup_updates_table = False):
 
 
 # section : test suite
-    
+
 def test_1_write_read_to_delta(spark, config: TestConfig):
     """
     Test write and read to delta table
-    Expected output: should print inserted rows        
+    Expected output: should print inserted rows
     """
     print("Running Test 1: writing and reading delta lake")
     setup_tables(spark, config)
@@ -563,7 +578,7 @@ def test_2_time_travel_read(spark, config: TestConfig):
     Test read from time travel point
 
     Setup: Insert some data at time t0, busy wait, insert more data at time t1.
-    time travel to (t1 - epsilon) and read data and only data from. 
+    time travel to (t1 - epsilon) and read data and only data from.
 
     Expected output: should print only rows inserted in first batch
     """
@@ -633,7 +648,15 @@ def test_4_read_change_data_feed(spark, config: TestConfig):
     """
     print("Running Test 6: Read change feed")
     setup_tables(spark, config)
-    read_change_data_feed(spark, config.get_table_id(), version_num="1")
+    version_num = "1"
+    if config.catalog_enabled:
+        table_name = config.get_table_id()
+        sql = f"SELECT * FROM table_changes('{table_name}', {version_num})"
+    else:
+        table_location = config.get_table_id()
+        sql = f"SELECT * FROM table_changes_by_path('{table_location}', {version_num})"
+    print(f"Running sql: {sql}")
+    spark.sql(sql).show()
 
 
 
@@ -832,6 +855,66 @@ def test_9_vacuum_table(spark, config: TestConfig):
     print(f"[post-vacuum] Found [{len(data_files)}] data files for kept partition [{to_keep_date}]; expected > 0")
 
 
+
+def test_9b_vacuum_table(spark, config: TestConfig):
+    """
+    Test vacuum.
+    Setup:
+    - Insert data in many partitions.
+    - Delete data in predetermined partitions
+    - vacuum
+
+    Expected outcome: no data files in deleted partition dir
+
+    NOTE: This vacuums relies on objects being physically partitioned (named) based on hive partitioning scheme.
+    Which is not required by delta spec. But if the objects are not hive partitioned this test is invalid.
+    """
+    print("Running Test 9: Vacuum test")
+
+    # 1. recreate table
+    setup_tables(spark, config)
+
+    # data for these partitions [10, 10] will be deleted
+    to_delete_date = date(year=2024, month=1, day=10)
+    # data for these partitions [16, 16] will be kept
+    to_keep_date = date(year=2024, month=1, day=16)
+    # number of records per partition
+    records_per_partition = 5
+
+    # 2. setup test
+    if config.exec_mode == TestRunMode.setup_only or config.exec_mode == TestRunMode.setup_and_validate:
+        to_delete_records = [OrderRecord.generate(order_date=to_delete_date) for _ in range(records_per_partition)]
+        print(f"Inserting records [to delete]: [count: {len(to_delete_records)}] {to_delete_records}")
+        write_data(spark, config.table_location, to_delete_records)
+
+        to_keep_records = [OrderRecord.generate(order_date=to_keep_date) for _ in range(records_per_partition)]
+        print(f"Inserting records [to live]: [count: {len(to_keep_records)}] {to_keep_records}")
+        write_data(spark, config.table_location, to_keep_records)
+    else:
+        print(f"Skipping test setup [config.exec_mode = {config.exec_mode}].")
+
+    if config.exec_mode == TestRunMode.setup_only:
+        # 2.1. exit; setup only run
+        return
+
+    # 3. run validation
+    print("Reading full table, expect 10 records")
+    read_table(spark, config.get_table_id())
+
+    data_files = get_partition_files(config.table_location, to_delete_date)
+    print(f"[pre-vacuum] Found [{len(data_files)}] data files for to be deleted partition [{to_delete_date}]; expected > 0")
+
+    # 3.2. perform vacuum
+    vacuum_table(spark, config.get_table_id())
+
+    # 3.3. check partition
+    data_files = get_partition_files(config.table_location, to_delete_date)
+    print(f"[post-vacuum] Found [{len(data_files)}] data files for deleted partition [{to_delete_date}]; expected == 0")
+    data_files = get_partition_files(config.table_location, to_keep_date)
+    print(f"[post-vacuum] Found [{len(data_files)}] data files for kept partition [{to_keep_date}]; expected > 0")
+
+
+
 def test_10_optimize_table(spark, config: TestConfig):
     """
     Test optimize table command
@@ -925,25 +1008,122 @@ def test_12_concurrent_writes_different_partition(spark, config: TestConfig):
         t.start()
 
 
+def perf_test_helper(spark, stmt: str):
+    """
+    Run query; time it
+    """
+    start_time = time.time()
+    print(f"Running sql: {stmt}")
+    spark.sql(stmt).show()
+    execution_duration = time.time() - start_time
+    print(f"Read latency: {execution_duration}")
+
+
+def perf_test_0_select_one(spark, config: TestConfig):
+    """
+    nyc_trips table:
+    StructType([StructField('passenger_count', DoubleType(), True), StructField('trip_distance', DoubleType(), True), StructField('VendorID', LongType(), True), StructField('tpep_pickup_datetime', TimestampType(), True), StructField('tpep_dropoff_datetime', TimestampType(), True), StructField('RatecodeID', IntegerType(), True), StructField('store_and_fwd_flag', StringType(), True), StructField('PULocationID', LongType(), True), StructField('DOLocationID', LongType(), True), StructField('payment_type', LongType(), True), StructField('fare_amount', DoubleType(), True), StructField('extra', DoubleType(), True), StructField('mta_tax', DoubleType(), True), StructField('tip_amount', DoubleType(), True), StructField('tolls_amount', DoubleType(), True), StructField('improvement_surcharge', DoubleType(), True), StructField('total_amount', DoubleType(), True), StructField('congestion_surcharge', DoubleType(), True), StructField('airport_fee', DoubleType(), True), StructField('rand_val', DoubleType(), True)])
+    """
+    perf_test_helper(spark, f"SELECT * FROM {config.get_table_id()} LIMIT 1")
+
+
+def perf_test_0_select_all(spark, config: TestConfig):
+    """
+    nyc_trips table:
+    StructType([StructField('passenger_count', DoubleType(), True), StructField('trip_distance', DoubleType(), True), StructField('VendorID', LongType(), True), StructField('tpep_pickup_datetime', TimestampType(), True), StructField('tpep_dropoff_datetime', TimestampType(), True), StructField('RatecodeID', IntegerType(), True), StructField('store_and_fwd_flag', StringType(), True), StructField('PULocationID', LongType(), True), StructField('DOLocationID', LongType(), True), StructField('payment_type', LongType(), True), StructField('fare_amount', DoubleType(), True), StructField('extra', DoubleType(), True), StructField('mta_tax', DoubleType(), True), StructField('tip_amount', DoubleType(), True), StructField('tolls_amount', DoubleType(), True), StructField('improvement_surcharge', DoubleType(), True), StructField('total_amount', DoubleType(), True), StructField('congestion_surcharge', DoubleType(), True), StructField('airport_fee', DoubleType(), True), StructField('rand_val', DoubleType(), True)])
+    """
+    perf_test_helper(spark, f"SELECT COUNT(*) FROM {config.get_table_id()}")
+
+
+def perf_test_1_select_with_filter(spark, config: TestConfig):
+    perf_test_helper(spark, f"SELECT COUNT(*) FROM {config.get_table_id()} WHERE tpep_pickup_datetime >= '2022-01-01' AND tpep_pickup_datetime <= '2024-01-01'")
+
+
+def perf_test_2_grouping_on_categorical_field(spark, config: TestConfig):
+    # apply grouping on: categorical field, e.g. VendorID, PULocationID
+    perf_test_helper(spark, f"SELECT VendorID, COUNT(*) AS ride_count FROM {config.get_table_id()} GROUP BY VendorID ORDER BY ride_count LIMIT 100")
+
+
+def perf_test_3a_grouping_on_numeric_field(spark, config: TestConfig):
+    # apply group by on a numeric field
+    sql = f"SELECT passenger_count, count(*) AS trip_count FROM {config.get_table_id()} GROUP BY passenger_count LIMIT 100"
+    perf_test_helper(spark, sql)
+
+
+def perf_test_3b_grouping_on_numeric_field(spark, config: TestConfig):
+    # apply grouping and ordering
+    sql = f"SELECT passenger_count, count(*) AS trip_count FROM {config.get_table_id()} GROUP BY passenger_count ORDER BY trip_count LIMIT 100"
+    perf_test_helper(spark, sql)
+
+
+def perf_test_3c_grouping_on_numeric_field(spark, config: TestConfig):
+    # filter on small subset of table; then apply grouping and ordering
+    sql = f"SELECT passenger_count, count(*) AS trip_count FROM {config.get_table_id()} WHERE year = 2015 AND month = 12 GROUP BY passenger_count ORDER BY trip_count LIMIT 100"
+    perf_test_helper(spark, sql)
+
+
+def perf_test_4_read_parquet_file(spark):
+    file_location = "gs://datalake-sb0/year=2023/month=1/part-00005-972ee5f8-a638-407a-bd89-6d6a70314728.c012.snappy.parquet"
+    print(f"Read file: {file_location}")
+    start_time = time.time()
+    count_dataframe(read_parquet_file(spark, file_location))
+    execution_duration = time.time() - start_time
+    print(f"Read latency: {execution_duration}")
+
+
+def perf_test_5_read_multiple_parquet_file(spark):
+    files = ["gs://datalake-sb9/dummy/part-00000-d0a6d67e-dea2-4633-95fb-3a2931cd818e-c000.snappy.parquet",
+            "gs://datalake-sb9/dummy/part-00001-d0a6d67e-dea2-4633-95fb-3a2931cd818e-c000.snappy.parquet",
+            "gs://datalake-sb9/dummy/part-00002-d0a6d67e-dea2-4633-95fb-3a2931cd818e-c000.snappy.parquet",
+            "gs://datalake-sb9/dummy/part-00003-d0a6d67e-dea2-4633-95fb-3a2931cd818e-c000.snappy.parquet"]
+    start_time = time.time()
+    for file_location in files:
+        print(f"Read file: {file_location}")
+        count_dataframe(read_parquet_file(spark, file_location))
+    execution_duration = time.time() - start_time
+    print(f"Read latency [4 files]: {execution_duration}")
+
+
+
+def perf_test_6_filter(spark, config: TestConfig):
+    # filter on small subset of table; then apply grouping and ordering
+    sql = f"SELECT passenger_count, count(*) AS trip_count FROM {config.get_table_id()} WHERE year = 2015 AND passenger_count > 4 GROUP BY passenger_count ORDER BY trip_count LIMIT 100"
+    perf_test_helper(spark, sql)
+
+
 # section: run tests
 
 # step 1: define config
+# functional test settings
 test_config = TestConfig(
-    table_location = "gs://path/to/table/root",
+    table_location = "gs://datalake-sb8/",
     table_name = "orders",
     updates_table_name = "orders_updates",
-    updates_table_location = "gs://path/to/updates/table/root",
-    recreate_setup=True,
+    updates_table_location = "gs://datalake-sb9/",
+    recreate_setup=False,
     exec_mode=TestRunMode.setup_and_validate,
     catalog_enabled=False,
 )
-# only needed locally
-# spark = get_session()
+
+# perf test setting
+perf_config = TestConfig(
+    table_location = "gs://datalake-sb11/",
+    table_name = "nyc_trips",
+    updates_table_name = "orders_updates",
+    updates_table_location = "gs://path/to/updates/table/root",
+    # !!NOTE!!: ensure recreate_setup = False
+    recreate_setup=False,
+    exec_mode=TestRunMode.setup_and_validate,
+    catalog_enabled=False,
+)
+
+
+spark = get_spark_session()
 
 # step 2: run tests
 
 # read tests
-test_1_write_read_to_delta(spark, test_config)
+#test_1_write_read_to_delta(spark, test_config)
 #test_2_time_travel_read(spark, test_config)
 #test_3_read_table_version(spark, test_config)
 #test_4_read_change_data_feed(spark, test_config)
@@ -961,3 +1141,22 @@ test_1_write_read_to_delta(spark, test_config)
 # concurrency tests
 # test_11_concurrent_writes_same_partition(spark, test_config)
 # test_12_concurrent_writes_different_partition(spark, test_config)
+
+# todo: move perf tests to separate module
+# performance tests
+#perf_test_0_select_one(spark, perf_config)
+#perf_test_0_select_all(spark, perf_config)
+#perf_test_1_select_with_filter(spark, perf_config)
+#perf_test_2_grouping_on_categorical_field(spark, perf_config)
+#perf_test_3a_grouping_on_numeric_field(spark, perf_config)
+#perf_test_3b_grouping_on_numeric_field(spark, perf_config)
+#perf_test_3c_grouping_on_numeric_field(spark, perf_config)
+#perf_test_4_read_parquet_file(spark)
+#perf_test_5_read_multiple_parquet_file(spark, perf_config)
+perf_test_6_filter(spark, perf_config)
+
+# generate parquet file
+# write_parquet(spark, "gs://datalake-sb9/dummy/", [OrderRecord.generate() for _ in range(1000)])
+# register_table(spark, test_config.table_name, test_config.table_location)
+# register_table(spark, perf_config.table_name, perf_config.table_location)
+#df = read_parquet_file(spark, "gs://datalake-sb11/year=2015/month=12/part-01319-972ee5f8-a638-407a-bd89-6d6a70314728.c001.snappy.parquet")
