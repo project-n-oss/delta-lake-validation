@@ -856,65 +856,6 @@ def test_9_vacuum_table(spark, config: TestConfig):
 
 
 
-def test_9b_vacuum_table(spark, config: TestConfig):
-    """
-    Test vacuum.
-    Setup:
-    - Insert data in many partitions.
-    - Delete data in predetermined partitions
-    - vacuum
-
-    Expected outcome: no data files in deleted partition dir
-
-    NOTE: This vacuums relies on objects being physically partitioned (named) based on hive partitioning scheme.
-    Which is not required by delta spec. But if the objects are not hive partitioned this test is invalid.
-    """
-    print("Running Test 9: Vacuum test")
-
-    # 1. recreate table
-    setup_tables(spark, config)
-
-    # data for these partitions [10, 10] will be deleted
-    to_delete_date = date(year=2024, month=1, day=10)
-    # data for these partitions [16, 16] will be kept
-    to_keep_date = date(year=2024, month=1, day=16)
-    # number of records per partition
-    records_per_partition = 5
-
-    # 2. setup test
-    if config.exec_mode == TestRunMode.setup_only or config.exec_mode == TestRunMode.setup_and_validate:
-        to_delete_records = [OrderRecord.generate(order_date=to_delete_date) for _ in range(records_per_partition)]
-        print(f"Inserting records [to delete]: [count: {len(to_delete_records)}] {to_delete_records}")
-        write_data(spark, config.table_location, to_delete_records)
-
-        to_keep_records = [OrderRecord.generate(order_date=to_keep_date) for _ in range(records_per_partition)]
-        print(f"Inserting records [to live]: [count: {len(to_keep_records)}] {to_keep_records}")
-        write_data(spark, config.table_location, to_keep_records)
-    else:
-        print(f"Skipping test setup [config.exec_mode = {config.exec_mode}].")
-
-    if config.exec_mode == TestRunMode.setup_only:
-        # 2.1. exit; setup only run
-        return
-
-    # 3. run validation
-    print("Reading full table, expect 10 records")
-    read_table(spark, config.get_table_id())
-
-    data_files = get_partition_files(config.table_location, to_delete_date)
-    print(f"[pre-vacuum] Found [{len(data_files)}] data files for to be deleted partition [{to_delete_date}]; expected > 0")
-
-    # 3.2. perform vacuum
-    vacuum_table(spark, config.get_table_id())
-
-    # 3.3. check partition
-    data_files = get_partition_files(config.table_location, to_delete_date)
-    print(f"[post-vacuum] Found [{len(data_files)}] data files for deleted partition [{to_delete_date}]; expected == 0")
-    data_files = get_partition_files(config.table_location, to_keep_date)
-    print(f"[post-vacuum] Found [{len(data_files)}] data files for kept partition [{to_keep_date}]; expected > 0")
-
-
-
 def test_10_optimize_table(spark, config: TestConfig):
     """
     Test optimize table command
@@ -1153,7 +1094,7 @@ spark = get_spark_session()
 #perf_test_3c_grouping_on_numeric_field(spark, perf_config)
 #perf_test_4_read_parquet_file(spark)
 #perf_test_5_read_multiple_parquet_file(spark, perf_config)
-perf_test_6_filter(spark, perf_config)
+#perf_test_6_filter(spark, perf_config)
 
 # generate parquet file
 # write_parquet(spark, "gs://datalake-sb9/dummy/", [OrderRecord.generate() for _ in range(1000)])
