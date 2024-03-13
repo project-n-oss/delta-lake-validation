@@ -5,6 +5,10 @@ Operates over 3 datasets:
 - nyc_trips (small files)
 - nyc_trips (big files)
 - synthetic dataset
+
+To run tests:
+- uncomment and set dataset_location
+- uncomment specific test to run
 """
 import time
 from functools import wraps
